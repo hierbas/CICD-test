@@ -118,6 +118,8 @@ param (
     [Parameter(HelpMessage = 'Used for debugging to only log to screen')][switch]$DebugOnlyStdOut
 )
 
+$password = "hej"
+$hmm = 
 $ScriptDir = Split-Path $MyInvocation.MyCommand.Path -Parent
 try {
     Import-Module "$ScriptDir\..\Telia-OrchTools\Telia-OrchTools.psm1" -ErrorAction Stop
