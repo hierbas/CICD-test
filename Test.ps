@@ -1,0 +1,354 @@
+<#
+    .SYNOPSIS
+        Script that will get the standard values for a specific OS
+
+    .DESCRIPTION
+        Each OS needs it's own 'hard-coded' standard values at deployment. This script will collect
+        all these and return a json-string with the result. 
+        It will both take values from a configuration file as well as putting together correct strings based on input.
+
+        The configuration file needs to be named "StandardValues.json" and be in the same folder as the script,
+        in the following format:
+        {
+            "Windows": {
+                "STANDARDVALUENAME": {
+                        "__keytype": "[VariableName that will be used to search for the right item. In Example: "Country"]",
+                        "__facts": {
+                            "Sweden": "ValueToBeReturned",
+                            "Finland": "ValueToBeReturned"
+                        }
+                }
+            }
+            ,
+            "Red Hat" : {
+                "STANDARDVALUENAME": {
+                        "__keytype": "[VariableName that will be used to search for the right item. In Example: "Country"]",
+                        "__facts": {
+                            "Sweden": "ValueToBeReturned",
+                            "Finland": {
+                                "__keytype": "[VariableName that will be used to search for the right item in this nested level. In Example: "OS"]",
+                                "__facts": {
+                                    "Red Hat Enterprise Linux 7": "ValueToBeReturned",
+                                    "Default": "ValueToBeReturned"
+                                }
+                            }
+                        }
+                }
+            }
+        }
+        
+        
+    .EXAMPLE
+        To run the script from an orchestrator runbook, use the "Run .NET Script" activity, with the following input:
+
+        -----------------
+        
+        $Result = & {Powershell64_Path} "{ScriptPath}\Common\Get-StdValuesFromConfig.ps1" `
+        -InstallationID "<InstallationID>" `
+        -OS "<OS>" `
+        -Country "<Country>" `
+        -MW "<MW>" `
+        -TargetEnvironment "<TargetEnvironment>" `
+        -SecurityLevel "<SecurityLevel>" `
+        -DebugOnlyStdOut "<DebugOnlyStdOut>" 
+
+        #Convert result from Json to PSObject
+        $Result = $Result | convertfrom-json
+
+        #Assign variables from Result.
+        $MW= $Result.MaintenanceWindow
+        
+        -----------------
+
+        Observe that the names within brackets are subscriptions of both Variables and Published Data.
+        
+        $Lastexitcode in Orchestrator will automatically contain the exitcode from Exit
+
+        --------
+        Try the script by hand by trying these rows.
+        .\Get-StdValuesFromConfig.ps1 -InstallationID 1234 -OS "Red Hat Enterprise Linux 8.5" -TargetEnvironment "DDC" -Country "Sweden" -HwType "physical" -SecurityLevel "Level 3" -MW "Patch week 1 - Wednesday 22:00-01:00"
+        .\Get-StdValuesFromConfig.ps1 -InstallationID 1234 -OS "Windows Server 2019 Standard" -TargetEnvironment "DDC" -Country "Sweden" -HwType "physical" -SecurityLevel "Level 3" -MW "Patch week 1 - Wednesday 22:00-01:00"
+        
+    .PARAMETER InstallationID
+        InstallationID of the current OS Deployment.
+    
+    .PARAMETER OS
+        The flavour of OS that is going to be installed as seen in CMDB.
+    
+    .PARAMETER Country
+        The country, in full form, that the server are going to be installed in.
+
+    .PARAMETER MW
+        Name of the Maintenance Window as seen in CMDB.
+
+    .PARAMETER TargetEnvironment
+        Name of the Network Target Environment as seen in CMDB.
+
+
+    .PARAMETER SecurityLevel
+        The network Security level as seen in CMDB.
+    
+    .PARAMETER WantedValues
+        If you want to specify the values needed you can add a comma separated list.
+    
+    .PARAMETER Servername
+        Linux only, used for building iso URL
+    .PARAMETER dnsdomain
+        Linux only, used for building iso URL
+    .PARAMETER DnsBmnPrimary
+        Linux only, used for some cases where primary BMN DNS should be set to CMDB value
+    
+    .PARAMETER DebugOnlyStdOut
+        If you want to debug and only show logging to std out
+#>
+
+param (
+    [Parameter(Mandatory = $true)][string]$InstallationID,
+    [Parameter(Mandatory = $true)][string]$OS,
+    [Parameter(Mandatory = $false)][string]$Country,
+    [Parameter(Mandatory = $false)][string]$MW,
+    [Parameter(Mandatory = $false)][string]$TargetEnvironment,
+    [Parameter(Mandatory = $false)][string]$SecurityLevel,
+    [Parameter(Mandatory = $false)][string]$HwType, # virtual or physical
+    [Parameter(Mandatory = $false)][string]$ScriptEnvironment,
+    [Parameter(Mandatory = $false)][string]$Servername,
+    [Parameter(Mandatory = $false)][string]$DnsDomain,
+    [Parameter(Mandatory = $false)][string]$DnsBmnPrimary,
+    [Parameter(Mandatory = $false,HelpMessage='Comma separated list accepted')][string]$WantedValues,
+    [Parameter(HelpMessage = 'Used for debugging to only log to screen')][switch]$DebugOnlyStdOut
+)
+
+$ScriptDir = Split-Path $MyInvocation.MyCommand.Path -Parent
+try {
+    Import-Module "$ScriptDir\..\Telia-OrchTools\Telia-OrchTools.psm1" -ErrorAction Stop
+}
+catch {
+    Throw "Failed to import module"
+    Exit 126 # The specified module could not be found.
+}
+
+# Write the script starting time into Orchestrator log
+Write-OrchLog -Message "Script start" -Errorlevel "DEBUG" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+
+# Log all arguments used to call this script.
+Write-OrchLog -Message $PSBoundParameters -Errorlevel "DEBUG" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+
+
+function Get-MaintenanceWindowName {
+    
+    <#
+        .DESCRIPTION
+            Function that will get the maintenance window correctly formatted.
+
+        .PARAMETER OS
+            OS Name
+
+        .PARAMETER MW
+            Maintenance Window name.
+    #>
+
+    param (
+        [Parameter(Mandatory = $true)][string]$OS,
+        [Parameter(Mandatory = $true)][string]$MW
+    )
+
+    If ($OS -like "*Windows*") {
+        # For Windows the addition of MW before the Maintentance Window name will be sufficient. 
+        # However, if set to Manual we leave this value blank.
+        If (Test-MaintenanceWindow -Name $MW) {
+            $ReturnValue = "MW - $MW"
+        }
+        ElseIf ($MW -eq "Manual") {
+            $ReturnValue = "MW - Manual"
+        }
+        Else {
+            # Will log an error that the string for Maintenance Window isn't in the correct format.
+            Write-OrchLog -Message "This string does not look like a MW: $MW" -Errorlevel "CRITICAL" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+            Exit 5895 # The actual data type of the property did not match the expected data type of the property.
+        }
+    }ElseIf ($OS -like "*Red Hat*" -or $OS -like "*RHEL*") {
+        If (Test-MaintenanceWindow -Name $MW) {
+            # Need to turn "Patch week 1 - Wednesday 22:00-01:00" in to "1-tsl-mt-patch-week-1-wednesday-2200-0100"
+            $ReturnValue = $MW.ToLower() -replace 'Patch week (\d) - (\w+day) (\d{2}):(\d{2})-(\d{2}):(\d{2})', '1-tsl-mt-patch-week-$1-$2-$3$4-$5$6'
+        }
+        ElseIf ($MW -eq "Manual") {
+            # Return a special if the mw is set to Manual.
+            $ReturnValue = "1-tsl-mt-manual"
+        }
+        Else {
+            # Will log an error that the string for Maintenance Window isn't in the correct format.
+            Write-OrchLog -Message "This string does not look like a MW: $MW" -Errorlevel "CRITICAL" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+            Exit 5895 # The actual data type of the property did not match the expected data type of the property.
+        }
+    }
+
+    return $ReturnValue
+
+}
+function Get-StdValue {
+    
+    <#
+        .DESCRIPTION
+            Function that will get the standard value from the config file. 
+            
+            Will use the __keytype value to grab the variable with the same name and then compare it to they keynames in __facts.
+            In case that there are several levels facts, this function will recurse on itself to get the last item.
+            If an item isn't found, it will check if there is a Default value in the list.
+
+            This is how an object can look.
+
+            "STANDARDVALUENAME": {
+                "__keytype": "{VariableName that will be used to search for the right item. In Example: "Country"}",
+                "__facts": {
+                    "Sweden": "ValueToBeReturned",
+                    "Finland": {
+                        "__keytype": "{VariableName that will be used to search for the right item. In Example: "OS"}",
+                        "__facts": {
+                            "Red Hat Enterprise Linux 5": "PXELinux BIOS",
+                            "Default": "ValueToBeReturned"
+                        }
+                    }
+                }
+            }
+            
+        .PARAMETER StdValObject
+            A PSOObject that is a subset of the config-file that is used to find the correct Standard Value.
+    #>
+
+    param (
+        [Parameter(Mandatory = $true)][PSObject]$StdValObject,
+        [Parameter(Mandatory = $true)][PSObject]$StdValName
+    )
+    
+
+    # Get the input variable value with the same name as mentioned in the KeyType.
+    
+    $KeyValueForSearch = (Get-Variable -ValueOnly $StdValObject.'__keytype')
+    if($null -eq $KeyValueForSearch -or "" -eq $KeyValueForSearch){
+        Write-OrchLog -Message "The needed input variable `"$($StdValObject.'__keytype')`" is not provided." -Errorlevel "CRITICAL" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+        Start-Sleep(1)
+
+        # Write the script end time into Orchestrator Log 
+        Write-OrchLog -Message "Script end" -Errorlevel "DEBUG" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+        Exit 1
+    }
+
+    # Try to find the correspondent config-value to the key.
+    $StdValue = ($StdValObject.__facts.PSObject.Properties | Where-Object { $KeyValueForSearch -match $_.Name }).Value
+
+    # If there isn't a value with the right key, search for a Default value.
+    if($null -eq $StdValue)
+    {
+        
+        $StdValue = ($StdValObject.__facts.PSObject.Properties | Where-Object { "Default" -match $_.Name }).Value
+
+        # If there isn't a value with the right key nor a default value, write an error and return an empty string.
+        if($null -eq $StdValue){
+            Write-OrchLog -Message "Cannot find a value for $StdValName with key $($StdValObject.'__keytype'): $KeyValueForSearch. " -Errorlevel "CRITICAL" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+            Start-Sleep(1)
+            # Write the script end time into Orchestrator Log 
+            Write-OrchLog -Message "Script end" -Errorlevel "DEBUG" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+            Exit 1
+        }
+    }
+
+    # If the found value is an object that contains a __keytype attribute, then call this same function again to get the bottom level value.
+    if($null -ne $StdValue.'__keytype'){
+
+        $StdValue = Get-StdValue -StdValObject $StdValue -StdValName $StdValName
+
+    }
+    
+    return $StdValue
+    
+}
+
+########
+# Main #
+########
+
+# Load the Configuration Json File into an PowerShell Object.
+If (Test-Path  "$ScriptDir\StandardValues.json"){
+    $StandardValuesObject  = (get-content $ScriptDir\StandardValues.json) | convertfrom-json
+}else{
+    Write-OrchLog -Message "Can't find the configuration file for standard values at $($ScriptDir)\StandardValues.json. " -Errorlevel "CRITICAL" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+    Start-Sleep(1)
+
+    # Write the script end time into Orchestrator Log 
+    Write-OrchLog -Message "Script end" -Errorlevel "DEBUG" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+    Exit 1
+}
+
+# Create an object with only the facts interesting for the current OS.
+$OsObject = ($StandardValuesObject.PSObject.Properties | Where-Object {$OS -match $_.Name}).Value
+if($null -eq $OsObject){
+    Write-OrchLog -Message "Can't find any values for the OS type provided. ($OS)" -Errorlevel "CRITICAL" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+    Start-Sleep(1)
+
+    # Write the script end time into Orchestrator Log 
+    Write-OrchLog -Message "Script end" -Errorlevel "DEBUG" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+    Exit 1
+}
+
+# If Wanted values are specified, add them to the list of items to get.
+if($null -ne $WantedValues -and "" -ne $WantedValues){
+    try{
+        [array]$ValuesToFetch = $WantedValues.Split(",")
+    }catch{
+        Write-OrchLog -Message "Unknown error when asking for values: ($WantedValues)" -Errorlevel "CRITICAL" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+        Start-Sleep(1)
+
+        # Write the script end time into Orchestrator Log 
+        Write-OrchLog -Message "Script end" -Errorlevel "DEBUG" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+        Exit 1
+    }
+}
+
+# Create an empty Data hash for the return values.
+$Data = @{}
+
+# Loop through the OsObject, retrieve all Standard Values and populate the Data hash.
+foreach ($StdValueType in $OsObject.PSObject.properties) {
+    # Check if there has been a request for specific values to get skip those that aren't in the list. If nothing specified, get all..
+    if($null -eq $WantedValues -or "" -eq $WantedValues -or $StdValueType.Name -in $ValuesToFetch){
+        $Data.Add( ($StdValueType.Name),  (Get-StdValue -StdValObject $StdValueType.Value -StdValName ($StdValueType.Name)))
+    }
+}
+
+# Add information about the Maintenance Window.
+# Check if there has been a request for specific values to get skip those that aren't in the list. 
+if($null -eq $WantedValues -or "" -eq $WantedValues -or "MaintenanceWindow" -in $ValuesToFetch){
+    $Data.Add( "MaintenanceWindow", (Get-MaintenanceWindowName $OS $MW) )
+}
+
+#Linux-only std value handling
+if($OS -like "*Red Hat*" -or $OS -like "*RHEL*"){
+    if($HwType -eq "Physical"){
+        #Build the complete iso URL
+        $isoURL = "https://$($Data.SatelliteVipIp):8443/pub/bootdisk/$servername.$dnsdomain.iso"
+        $Data.Add("isoURL",$isoURL)
+    }
+    else{
+        $FQDN = (Get-TableServerInfo -FQDN -InstallationID $InstallationID).FQDN.Trim()
+        $isoURL = "$($Data.SatelliteURL)/bootdisk/api/hosts/$($FQDN)?full=true"
+        $Data.Add("isoURL",$isoURL)
+    }
+    #set os minor version to "latest and greatest (LaG)"
+    if($Data.OSMinorVersion -eq "LaG"){
+        $Data.OSMinorVersion = $Data.LaG
+    }
+    #Set DnsBmnPrimary to value fetched from CMDB
+    if($Data.DnsBmnPrimary -eq "CMDB"){
+        $Data.DnsBmnPrimary = $DnsBmnPrimary
+    }
+
+}
+# Write the Data hash to logfile.
+Write-OrchLog -Message "Standard values retrieved: $($Data | ConvertTo-Json) " -Errorlevel "DEBUG" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+Start-Sleep(1)
+
+# Write the script end time into Orchestrator Log 
+Write-OrchLog -Message "Script end" -Errorlevel "DEBUG" -InstallationID $InstallationID -DebugOnlyStdOut $DebugOnlyStdOut
+
+# Return the Data hash in Json-format to Orchestrator.
+Return ($Data | ConvertTo-Json)
